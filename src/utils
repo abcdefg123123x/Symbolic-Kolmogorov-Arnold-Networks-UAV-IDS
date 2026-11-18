@@ -1,0 +1,363 @@
+
+"""
+utils.py
+
+Contains utility functions for evaluating model performance,
+generating classification plots, and saving Optuna optimisation
+results.
+
+These functions are shared across the different models in the project.
+"""
+
+import os
+
+import optuna
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    roc_curve
+)
+
+
+# ============================================================
+# ROC curve
+# ============================================================
+
+def plot_binary_roc(all_labels, y_score, roc_auc, output_dir, model_name):
+    """
+    Generates and saves the ROC curve for binary classification.
+
+    The curve shows the trade-off between the true positive rate
+    and false positive rate at different classification thresholds.
+    """
+
+    fpr, tpr, _ = roc_curve(all_labels, y_score)
+
+    plt.figure(figsize=(8, 6))
+
+    # Plot the model's ROC curve alongside the random classifier baseline.
+    plt.plot(
+        fpr,
+        tpr,
+        color="darkorange",
+        lw=2,
+        label=f"ROC curve (AUC = {roc_auc:.4f})"
+    )
+
+    plt.plot(
+        [0, 1],
+        [0, 1],
+        color="navy",
+        lw=2,
+        linestyle="--",
+        label="Random Guess"
+    )
+
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+
+    plt.xlabel("False Positive Rate", fontsize=12)
+    plt.ylabel("True Positive Rate", fontsize=12)
+
+    plt.title(
+        f"Receiver Operating Characteristic - {model_name}",
+        fontsize=14
+    )
+
+    plt.legend(loc="lower right", fontsize=11)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+
+    # Save the figure so it can be used in the final results.
+    roc_path = os.path.join(output_dir, "roc_curve.png")
+
+    plt.savefig(roc_path, dpi=300)
+    plt.close()
+
+    print(f"ROC curve saved to: {roc_path}")
+
+
+# ============================================================
+# Model evaluation
+# ============================================================
+
+def evaluate_model(
+        all_preds,
+        all_labels,
+        encoder,
+        config,
+        all_probs,
+        model_name
+):
+    """
+    Evaluates a trained model using its predictions and probabilities.
+
+    Generates a classification report, confusion matrix and ROC-AUC
+    score where applicable. All evaluation plots and reports are
+    saved in the model's output directory.
+
+    Args:
+        all_preds: Predicted class labels.
+        all_labels: Actual class labels.
+        encoder: Fitted LabelEncoder used during preprocessing.
+        config: Project configuration dictionary.
+        all_probs: Predicted class probabilities, if available.
+        model_name: Name of the model being evaluated.
+
+    Returns:
+        Test accuracy as a percentage.
+    """
+
+    dataset_name = config["data"]["name"]
+    is_binary = config["data"]["binary_mode"]
+
+    classification_mode = "binary" if is_binary else "multi"
+
+    # Keep results organised by dataset, classification type and model.
+    output_dir = os.path.join(
+        "output results",
+        dataset_name,
+        classification_mode,
+        f"{model_name}_results"
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Convert predictions and labels to NumPy arrays for evaluation.
+    all_preds = np.asarray(all_preds).flatten()
+    all_labels = np.asarray(all_labels).flatten()
+
+    if len(all_preds) != len(all_labels):
+        raise ValueError(
+            "The number of predictions does not match "
+            "the number of actual labels."
+        )
+
+    # Use the encoder to keep class names consistent with preprocessing.
+    target_names = [str(label) for label in encoder.classes_]
+
+    # --------------------------------------------------------
+    # Classification report
+    # --------------------------------------------------------
+
+    report = classification_report(
+        all_labels,
+        all_preds,
+        labels=np.arange(len(target_names)),
+        target_names=target_names,
+        digits=4,
+        zero_division=0
+    )
+
+    print("\nClassification Report:")
+    print(report)
+
+    report_path = os.path.join(
+        output_dir,
+        "clasif_report.txt"
+    )
+
+    with open(report_path, "w") as f:
+        f.write(report)
+
+    print(f"Classification report saved to: {report_path}")
+
+    # --------------------------------------------------------
+    # ROC-AUC evaluation
+    # --------------------------------------------------------
+
+    if all_probs is not None:
+        all_probs = np.asarray(all_probs)
+        num_classes = len(target_names)
+
+        if len(all_probs) != len(all_labels):
+            raise ValueError(
+                "The number of probability predictions does not "
+                "match the number of actual labels."
+            )
+
+        if num_classes == 2:
+            # For binary classification, ROC-AUC uses the probability
+            # assigned to the positive class.
+            y_score = (
+                all_probs[:, 1]
+                if all_probs.ndim == 2 and all_probs.shape[1] > 1
+                else all_probs.flatten()
+            )
+
+            roc_auc = roc_auc_score(all_labels, y_score)
+
+            plot_binary_roc(
+                all_labels,
+                y_score,
+                roc_auc,
+                output_dir,
+                model_name
+            )
+
+        else:
+            # Multi-class ROC-AUC is calculated using a one-vs-rest
+            # approach and averaged across all classes.
+            roc_auc = roc_auc_score(
+                all_labels,
+                all_probs,
+                labels=np.arange(num_classes),
+                multi_class="ovr",
+                average="macro"
+            )
+
+        print(f"Test ROC-AUC (Macro OvR): {roc_auc:.4f}")
+
+    # --------------------------------------------------------
+    # Confusion matrix
+    # --------------------------------------------------------
+
+    cm = confusion_matrix(
+        all_labels,
+        all_preds,
+        labels=np.arange(len(target_names))
+    )
+
+    # Normalise each row to show the proportion of predictions
+    # made for each actual class, while keeping counts as annotations.
+    cm_proportional = cm.astype(float) / (
+        cm.sum(axis=1, keepdims=True) + 1e-9
+    )
+
+    plt.figure(figsize=(10, 8))
+
+    sns.heatmap(
+        cm_proportional,
+        annot=cm,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=target_names,
+        yticklabels=target_names,
+        cbar=False
+    )
+
+    plt.title(f"Confusion Matrix - {model_name}")
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.tight_layout()
+
+    cm_path = os.path.join(
+        output_dir,
+        "confusion_matrix.png"
+    )
+
+    plt.savefig(cm_path, dpi=300)
+    plt.close()
+
+    print(f"Confusion matrix saved to: {cm_path}")
+
+    # --------------------------------------------------------
+    # Final accuracy
+    # --------------------------------------------------------
+
+    accuracy = 100 * np.mean(all_preds == all_labels)
+
+    print(f"\nTest Accuracy: {accuracy:.2f}%")
+
+    return accuracy
+
+
+# ============================================================
+# Optuna visualisation
+# ============================================================
+
+def save_optuna_plots(study, model_name, config):
+    """
+    Generates and saves diagnostic plots from an Optuna study.
+
+    The optimisation history shows how the objective value changes
+    across trials, while the parameter importance plot highlights
+    which hyperparameters have the greatest influence on the results.
+
+    These plots can also be used when analysing the hyperparameter
+    tuning process in the final experimental report.
+    """
+
+    dataset_name = config["data"]["name"]
+    is_binary = config["data"]["binary_mode"]
+
+    classification_mode = "binary" if is_binary else "multi"
+
+    output_dir = os.path.join(
+        "optuna plots",
+        dataset_name,
+        classification_mode
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"\nGenerating Optuna plots for {model_name}...")
+
+    # --------------------------------------------------------
+    # Optimisation history
+    # --------------------------------------------------------
+
+    try:
+        optuna.visualization.matplotlib.plot_optimization_history(study)
+
+        plt.title(f"Optuna Optimisation History - {model_name}")
+        plt.tight_layout()
+
+        history_path = os.path.join(
+            output_dir,
+            f"{model_name}_optimisation_history.png"
+        )
+
+        plt.savefig(history_path, dpi=300)
+        plt.close()
+
+        print(f"Optimisation history saved to: {history_path}")
+
+    except Exception as e:
+        print(f"Could not generate optimisation history: {e}")
+
+    # --------------------------------------------------------
+    # Hyperparameter importance
+    # --------------------------------------------------------
+
+    # Parameter importance requires enough completed trials
+    # to provide a meaningful comparison.
+    completed_trials = [
+        trial for trial in study.trials
+        if trial.state == optuna.trial.TrialState.COMPLETE
+    ]
+
+    if len(completed_trials) > 1:
+        try:
+            optuna.visualization.matplotlib.plot_param_importances(study)
+
+            plt.title(f"Hyperparameter Importances - {model_name}")
+            plt.tight_layout()
+
+            importance_path = os.path.join(
+                output_dir,
+                f"{model_name}_param_importances.png"
+            )
+
+            plt.savefig(importance_path, dpi=300)
+            plt.close()
+
+            print(
+                f"Parameter importance plot saved to: {importance_path}"
+            )
+
+        except Exception as e:
+            print(f"Skipping parameter importance plot: {e}")
+
+    else:
+        print(
+            "Skipping parameter importance plot: "
+            "not enough completed trials."
+        )
+
+    print(f"Optuna plots saved in: {output_dir}")
