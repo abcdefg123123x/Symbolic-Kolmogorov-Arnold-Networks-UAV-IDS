@@ -1,0 +1,517 @@
+
+"""
+symbolic.py
+
+Extracts symbolic equations from a previously trained KAN model
+using PySR and evaluates their performance on the test dataset.
+
+Supports both binary and multi-class classification.
+"""
+
+import io
+import contextlib
+import os
+
+import numpy as np
+import torch
+
+from matplotlib import pyplot as plt
+from pysr import PySRRegressor
+
+from sklearn.metrics import (
+    classification_report,
+    accuracy_score,
+    confusion_matrix,
+    ConfusionMatrixDisplay
+)
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+
+
+# ============================================================
+# Small utility functions
+# ============================================================
+
+def sigmoid(x):
+    """Converts continuous model outputs into values between 0 and 1."""
+    x = np.clip(x, -50, 50)
+    return 1 / (1 + np.exp(-x))
+
+
+# ============================================================
+# Symbolic equation extraction
+# ============================================================
+
+def extract_symbolic_equations(
+        model,
+        model_name,
+        train_loader,
+        device,
+        config,
+        maxsize=None
+):
+    """
+    Extracts symbolic expressions from a trained KAN model.
+
+    The trained model is first used to generate predictions for the
+    training data. PySR then attempts to find mathematical expressions
+    that approximate these predictions.
+
+    For binary classification, a single equation is generated.
+    For multi-class classification, a separate equation is fitted
+    for each class.
+
+    Args:
+        model: Previously trained KAN model.
+        model_name: Name used when reporting results.
+        train_loader: DataLoader containing the training samples.
+        device: Device used for model inference.
+        config: Project configuration dictionary.
+        maxsize: Optional maximum complexity allowed for PySR equations.
+
+    Returns:
+        Dictionary containing the fitted symbolic model(s).
+    """
+
+    # Put the model in evaluation mode before collecting predictions.
+    model.eval()
+    model.to(device)
+
+    is_binary = config["data"]["binary_mode"]
+    niterations = 30
+
+    # Determine the number of output classes from a sample batch.
+    with torch.no_grad():
+        sample_batch_x, _ = next(iter(train_loader))
+        sample_batch_x = sample_batch_x.to(device)
+
+        sample_outputs = model(sample_batch_x)
+
+        num_classes = 2 if is_binary else sample_outputs.shape[-1]
+
+    task_name = "Binary" if is_binary else f"Multi-Class ({num_classes} classes)"
+
+    print(
+        f"\n[Symbolic Extractor] Model: {model_name} | Task: {task_name}"
+    )
+
+    # --------------------------------------------------------
+    # Collect training inputs and predictions from the KAN
+    # --------------------------------------------------------
+
+    train_inputs = []
+    train_logits = []
+
+    with torch.no_grad():
+        for batch_x, _ in train_loader:
+            batch_x = batch_x.to(device)
+
+            outputs = model(batch_x)
+
+            # Store everything on the CPU as NumPy arrays for PySR.
+            train_inputs.append(batch_x.cpu().numpy())
+            train_logits.append(outputs.cpu().numpy())
+
+    X_train = np.concatenate(train_inputs, axis=0)
+    Y_train_logits = np.concatenate(train_logits, axis=0)
+
+    # Use the model's predicted classes to guide stratified sampling.
+    if is_binary:
+        if Y_train_logits.ndim > 1 and Y_train_logits.shape[-1] > 1:
+            approx_labels = np.argmax(Y_train_logits, axis=1)
+        else:
+            approx_labels = (
+                Y_train_logits.squeeze() > 0.5
+            ).astype(int)
+    else:
+        approx_labels = np.argmax(Y_train_logits, axis=1)
+
+    # --------------------------------------------------------
+    # Reduce the number of samples if the dataset is too large
+    # --------------------------------------------------------
+
+    max_samples = 10000
+
+    if X_train.shape[0] > max_samples:
+        print(
+            f"Reducing symbolic training data from {X_train.shape[0]} "
+            f"to {max_samples} samples using stratified sampling..."
+        )
+
+        sample_ratio = max_samples / X_train.shape[0]
+
+        (
+            X_train,
+            _,
+            Y_train_logits,
+            _,
+            approx_labels,
+            _
+        ) = train_test_split(
+            X_train,
+            Y_train_logits,
+            approx_labels,
+            train_size=sample_ratio,
+            stratify=approx_labels,
+            random_state=42
+        )
+
+    # --------------------------------------------------------
+    # Remove samples containing invalid values
+    # --------------------------------------------------------
+
+    # Each sample must have valid input features and target outputs.
+    valid_mask = (
+        np.isfinite(X_train).all(axis=1)
+        & np.isfinite(Y_train_logits).all(
+            axis=1 if Y_train_logits.ndim > 1 else None
+        )
+    )
+
+    if not valid_mask.all():
+        removed_samples = np.sum(~valid_mask)
+
+        print(
+            f"Removing {removed_samples} samples containing "
+            "NaN or infinite values."
+        )
+
+        X_train = X_train[valid_mask]
+        Y_train_logits = Y_train_logits[valid_mask]
+        approx_labels = approx_labels[valid_mask]
+
+    if len(X_train) == 0:
+        raise ValueError("No valid samples remain for symbolic extraction.")
+
+    # --------------------------------------------------------
+    # Calculate sample weights to handle class imbalance
+    # --------------------------------------------------------
+
+    # Classes with fewer samples receive higher weights so that
+    # PySR does not focus too heavily on the majority class.
+    unique_classes_present = np.unique(approx_labels)
+
+    computed_weights = compute_class_weight(
+        class_weight="balanced",
+        classes=unique_classes_present,
+        y=approx_labels
+    )
+
+    weight_dict = dict(zip(unique_classes_present, computed_weights))
+
+    sample_weights = np.array([
+        weight_dict.get(label, 1.0)
+        for label in approx_labels
+    ])
+
+    symbolic_results = {}
+
+    # --------------------------------------------------------
+    # Configure PySR
+    # --------------------------------------------------------
+
+    # Keep the search space relatively simple to encourage
+    # readable equations rather than unnecessarily complex ones.
+    pysr_kwargs = {
+        "niterations": niterations,
+        "binary_operators": ["+", "*", "-"],
+        "unary_operators": ["tanh", "sin"],
+        "constraints": {"/": (-1, 1)},
+        "elementwise_loss": "weighted_l2(x, y, w) = w * (x - y)^2",
+        "progress": False,
+        "verbosity": 0
+    }
+
+    if maxsize is not None:
+        pysr_kwargs["maxsize"] = maxsize
+
+    # --------------------------------------------------------
+    # Binary classification: fit one symbolic equation
+    # --------------------------------------------------------
+
+    if is_binary:
+        print("\n--- Starting PySR: Binary Classification ---")
+
+        # Select the output corresponding to the positive class.
+        target_col = (
+            1 if (
+                Y_train_logits.ndim > 1
+                and Y_train_logits.shape[-1] > 1
+            ) else 0
+        )
+
+        y_target = (
+            Y_train_logits[:, target_col]
+            if Y_train_logits.ndim > 1
+            else Y_train_logits
+        )
+
+        pysr_model = PySRRegressor(**pysr_kwargs)
+
+        # Suppress PySR's internal output to keep the console readable.
+        with contextlib.redirect_stdout(io.StringIO()):
+            pysr_model.fit(
+                X_train,
+                y_target,
+                weights=sample_weights
+            )
+
+        best_eq = pysr_model.get_best()
+
+        symbolic_results["type"] = "binary"
+        symbolic_results["model"] = pysr_model
+
+        print(f"Best binary equation: {best_eq['equation']}")
+
+    # --------------------------------------------------------
+    # Multi-class classification: fit one equation per class
+    # --------------------------------------------------------
+
+    else:
+        print(
+            f"\n--- Starting PySR: Multi-Class Classification "
+            f"({num_classes} equations) ---"
+        )
+
+        class_equations = {}
+
+        for c in range(num_classes):
+            print(f"Fitting symbolic equation for class {c}...")
+
+            # Each equation approximates the KAN output for one class.
+            y_class = Y_train_logits[:, c]
+
+            pysr_model = PySRRegressor(**pysr_kwargs)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                pysr_model.fit(
+                    X_train,
+                    y_class,
+                    weights=sample_weights
+                )
+
+            best_eq = pysr_model.get_best()
+
+            class_equations[c] = {
+                "model": pysr_model,
+                "equation": best_eq
+            }
+
+            print(
+                f"  Class {c}: {best_eq['equation']} "
+                f"(Loss: {best_eq['loss']:.4f})"
+            )
+
+        symbolic_results["type"] = "multiclass"
+        symbolic_results["equations"] = class_equations
+
+    return symbolic_results
+
+
+# ============================================================
+# Evaluate symbolic equations
+# ============================================================
+
+def evaluate_symbolic_equations(
+        symbolic_results,
+        X_test,
+        y_test,
+        model_name,
+        config,
+        threshold
+):
+    """
+    Evaluates the extracted symbolic equations on the test dataset.
+
+    Predictions are generated directly from the saved PySR models.
+    The function then calculates classification metrics and saves
+    the confusion matrix and classification report.
+
+    Args:
+        symbolic_results: Dictionary returned by the extraction function.
+        X_test: Test features as a NumPy array.
+        y_test: Ground-truth test labels.
+        model_name: Name of the model being evaluated.
+        config: Project configuration dictionary.
+        threshold: Decision threshold used for binary classification.
+
+    Returns:
+        Dictionary containing predictions, probabilities and metrics.
+    """
+
+    is_binary = config["data"]["binary_mode"]
+
+    print(
+        f"\nEvaluating symbolic equations for {model_name}..."
+    )
+
+    # Make sure the target labels are stored as a flat NumPy array.
+    y_test = np.asarray(y_test).flatten()
+
+    # --------------------------------------------------------
+    # Generate predictions using the extracted equations
+    # --------------------------------------------------------
+
+    if symbolic_results["type"] == "binary":
+
+        # The symbolic model produces a continuous output.
+        preds_continuous = symbolic_results["model"].predict(X_test)
+
+        # Convert continuous outputs into probabilities.
+        preds_probs = sigmoid(preds_continuous)
+
+        # Apply the selected threshold to obtain class predictions.
+        y_pred = (preds_probs > threshold).astype(int)
+
+        # Store probabilities for both classes.
+        probabilities = np.vstack([
+            1 - preds_probs,
+            preds_probs
+        ]).T
+
+        print(f"Binary classification threshold: {threshold}")
+
+    else:
+        # Generate one output column for each class.
+        num_classes = len(symbolic_results["equations"])
+
+        logits_matrix = np.zeros(
+            (X_test.shape[0], num_classes)
+        )
+
+        for c in range(num_classes):
+            pysr_model = symbolic_results["equations"][c]["model"]
+
+            logits_matrix[:, c] = pysr_model.predict(X_test)
+
+        # The class with the highest symbolic output is selected.
+        y_pred = np.argmax(logits_matrix, axis=1)
+
+        # Convert the outputs into probabilities using softmax.
+        # Subtracting the maximum value helps numerical stability.
+        exp_logits = np.exp(
+            logits_matrix - np.max(
+                logits_matrix,
+                axis=1,
+                keepdims=True
+            )
+        )
+
+        probabilities = exp_logits / np.sum(
+            exp_logits,
+            axis=1,
+            keepdims=True
+        )
+
+    # --------------------------------------------------------
+    # Check prediction and target lengths
+    # --------------------------------------------------------
+
+    # Keep the arrays aligned before calculating the metrics.
+    min_len = min(len(y_test), len(y_pred))
+
+    y_test = y_test[:min_len]
+    y_pred = y_pred[:min_len]
+    probabilities = probabilities[:min_len]
+
+    # --------------------------------------------------------
+    # Calculate classification metrics
+    # --------------------------------------------------------
+
+    acc = accuracy_score(y_test, y_pred)
+
+    cm = confusion_matrix(y_test, y_pred)
+
+    report_str = classification_report(
+        y_test,
+        y_pred,
+        zero_division=0,
+        digits=4
+    )
+
+    report_dict = classification_report(
+        y_test,
+        y_pred,
+        output_dict=True,
+        zero_division=0
+    )
+
+    macro_f1 = report_dict["macro avg"]["f1-score"]
+
+    # --------------------------------------------------------
+    # Create the output directory
+    # --------------------------------------------------------
+
+    dataset_name = config["data"]["name"]
+    classification_mode = "binary" if is_binary else "multi"
+
+    output_dir = os.path.join(
+        "output results",
+        dataset_name,
+        classification_mode,
+        f"{model_name}_symbolic_results"
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # --------------------------------------------------------
+    # Save the confusion matrix
+    # --------------------------------------------------------
+
+    cm_path = os.path.join(
+        output_dir,
+        "symbolic_confusion_matrix.png"
+    )
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    disp = ConfusionMatrixDisplay(
+        confusion_matrix=cm
+    )
+
+    disp.plot(
+        cmap=plt.cm.Blues,
+        ax=ax,
+        colorbar=False
+    )
+
+    ax.set_title(f"Confusion Matrix - {model_name}")
+
+    plt.tight_layout()
+    plt.savefig(cm_path, dpi=300)
+    plt.close(fig)
+
+    # --------------------------------------------------------
+    # Save the classification report
+    # --------------------------------------------------------
+
+    report_path = os.path.join(
+        output_dir,
+        "classification_report.txt"
+    )
+
+    with open(report_path, "w") as f:
+        f.write(report_str)
+
+    # --------------------------------------------------------
+    # Display final results
+    # --------------------------------------------------------
+
+    print(
+        f"\n=== Symbolic Model Results: {model_name} ==="
+    )
+
+    print(f"Test Accuracy: {acc:.4f}")
+    print(f"Macro F1-score: {macro_f1:.4f}")
+
+    print(f"Confusion matrix saved to: {cm_path}")
+    print(f"Classification report saved to: {report_path}")
+
+    return {
+        "predictions": y_pred,
+        "probabilities": probabilities,
+        "macro_f1": macro_f1,
+        "accuracy": acc,
+        "conf_mat": cm,
+        "clasif_rep": report_str
+    }
